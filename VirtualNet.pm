@@ -16,7 +16,7 @@ require Exporter;
 @ISA = qw(Exporter AutoLoader Business::OnlinePayment);
 @EXPORT = qw();
 @EXPORT_OK = qw();
-$VERSION = '0.01';
+$VERSION = '0.02';
 
 $DEBUG ||= 0;
 
@@ -68,25 +68,9 @@ sub submit {
     my %content = $self->content;
 
     my $action = lc($content{'action'});
-    #die 'eSec only supports "Authorization Only" transactions'
-    #  unless $action eq 'authorization only';
 
-    #my %typemap = (
-    #  "VISA card"                  => 'visa',
-    #  "MasterCard"                 => 'mastercard',
-    #  "Discover card"              => 'discover', #not supported...
-    #  "American Express card"      => 'amex',
-    #  "Diner's Club/Carte Blanche" => 'dinersclub',
-    #  "enRoute"                    => 'enroute', #not supported...
-    #  "JCB"                        => 'jcb',
-    #  "BankCard"                   => 'bankcard',
-    #);
-    #my $cardtype = $self->test_transaction
-    #                 ? 'testcard'
-    #                 : $typemap{cardtype($content{'card_number'})};
-
-   #? what's supported
-   if (  $self->transaction_type() =~
+    #? what's supported
+    if (  $self->transaction_type() =~
            /^(cc|visa|mastercard|american express|discover)$/i ) {
       $self->required_fields(qw/type action amount card_number expiration/);
     } else {
@@ -131,43 +115,30 @@ sub submit {
 
     if ( $page =~ /^(\d+)\s+\-\s+(\S.*)$/ ) {
       die "VirtualNet protocol error: $page";
-      #$self->is_success(0);
-      #$self->result_code($1);
-      #$self->error_message($2);
-      #$self->error_message($page);
-    } else {
-      warn "protocol sucessful, decoding VisaNet-II response\n" if $DEBUG;
+    }
 
-      isEvenParity($page) or die "VisaNet-II response not even parity";
+    warn "protocol sucessful, decoding VisaNet-II response\n" if $DEBUG;
 
-      $page =~ s/(.)/pack('C', unpack('C',$1) & 0x7f)/ge; #drop parity bits
+    isEvenParity($page) or die "VisaNet-II response not even parity";
+    $page =~ s/(.)/pack('C', unpack('C',$1) & 0x7f)/ge; #drop parity bits
 
-      #warn $page;
+    my %response;
+    if ( $action eq 'authorization only' ) {
+      %response = $self->eis1080_response( $page );
+    } elsif ( $action eq 'post authorization' ) { 
+      %response = $self->eis1081_response( $page );
+    #} elsif ( $action eq 'normal authorization' ) {
+    #  croak 'Normal Authorization not supported';
+    #} elsif ( $action eq 'credit' ) {
+    #  croak 'Credit not (yet) supported';
+    }
 
-      my %response;
-      if ( $action eq 'authorization only' ) {
-        %response = $self->eis1080_response( $page );
-      } elsif ( $action eq 'post authorization' ) { 
-        %response = $self->eis1081_response( $page );
-      #} elsif ( $action eq 'normal authorization' ) {
-      #  croak 'Normal Authorization not supported';
-      #} elsif ( $action eq 'credit' ) {
-      #  croak 'Credit not (yet) supported';
-      }
-
-#      $self->is_success($response{is_success});
-#      $self->result_code($response{result_code});
-#      $self->error_message($response{error_message});
-#      $self->authorization($response{authorization});
-
-       for my $field ( qw( is_success result_code error_message authorization
-                           authorization_source_code returned_ACI
-                           transaction_identifier validation_code
-                           transaction_sequence_num local_transaction_date
-                           local_transaction_time AVS_result_code ) ) {
-         $self->$field($response{$field});
-       }
-
+    for my $field ( qw( is_success result_code error_message authorization
+                        authorization_source_code returned_ACI
+                        transaction_identifier validation_code
+                        transaction_sequence_num local_transaction_date
+                        local_transaction_time AVS_result_code ) ) {
+      $self->$field($response{$field});
     }
 
 }
@@ -267,9 +238,9 @@ sub eis1080_request {
                                   # ***FIXME***
   $content .= '705';              # 49-51 3    Time Zone Differential: 705=EST
   $content .= $self->mcc;         # 52-55 4    Metchant Category Code: 5999
-  $content .= 'N';                # 56    1    Requested ACI (Authorization
+  $content .= 'Y';                # 56    1    Requested ACI (Authorization
                                   #            Characteristics Indicator):
-                                  #            N=Device is not CPS capable
+                                  #            Y=Device is CPS capable
   $content .= $seq;               # 57-60 4    Tran Sequence Number
   $content .= '56';               # 61-62 2    Auth Transaction Code:
                                   #            56=Card Not Present
@@ -339,12 +310,17 @@ sub eis1080_response {
   my( $self, $response) = @_;
   my %response;
 
-  $response =~ /^$STX(.{67})([\w ]{0,15})$FS([\w ]{0,4})$FS.*$ETX(.)$/
+  #$response =~ /^$STX(.{67})([\w ]{0,15})$FS([\w ]{0,4})$FS.*$ETX(.)$/
+  $response =~ /^$STX(.{67})([\w ]{0,15})$FS([\w ]{0,4})$FS(\d{3})$ETX(.)$/
     or die "can't decode (eis1080) response: $response\n". join(' ', map { sprintf("%x", unpack('C',$_)) } split('', $response) );
   ( $response{transaction_identifier},
     $response{validation_code},
+    my $group3version,
     my $lrc
-  ) = ($2, $3, $4);
+  ) = ($2, $3, $4, $5);
+
+  die "group iii version $group3version ne 014"
+    unless $group3version eq '014';
 
   warn "$response\n".
        join(' ', map { sprintf("%x", unpack('C',$_)) } split('', $response) ).
@@ -384,9 +360,6 @@ sub eis1080_response {
   $response{result_code} = $response{response_code};
   $response{error_message} = $response{auth_response_text};
   $response{authorization} = $response{approval_code};
-  #$response{returned_ACI} = $response{returned_ACI};
-  #$response{authorization_source_code} = $response{authorization_source_code};
-  #$response{transaction_sequence_num} = $response{transaction_sequence_num};
 
   %response;
 }
@@ -509,12 +482,12 @@ sub eis1081_request {
   #14-35 22 A/N Cardholder Account Number Left-Justified/Space-Filled 4.30
   $detail .= substr( $param->{card_number}.'                      ', 0, 22 );
 
-  $detail .= 'N';                # 36    1    Requested ACI (Authorization
+  $detail .= 'Y';                # 36    1    Requested ACI (Authorization
                                  #            Characteristics Indicator):
                                  #            N (4.163)
 
   # 37 1 A/N Returned ACI (4.168)
-  $detail .= $param->{returned_ACI} || 'N';
+  $detail .= $param->{returned_ACI} || ' ';
 
   # *** 38 1 A/N Authorization Source Code (4.13)
   $detail .= $param->{authorization_source_code} || '6';
@@ -548,7 +521,11 @@ sub eis1081_request {
   $detail .= $param->{AVS_result_code};
 
   # 62-76 15 A/N Transaction Identifier Left-Justified/Space-Filled 4.206
-  $detail .= substr($param->{transaction_identifier}. (' 'x15), 0, 15);
+  my $transaction_identifier =
+    length($param->{transaction_identifier})
+      ? substr($param->{transaction_identifier}. (' 'x15), 0, 15)
+      : '000000000000000';
+  $detail .= $transaction_identifier;
 
   # 77-80 4 A/N Validation Code 4.218
   $detail .= substr($param->{validation_code}.'    ', 0, 4);

@@ -4,6 +4,7 @@ use Business::OnlinePayment;
 
 $DEBUG = 0;
 $Business::OnlinePayment::VirtualNet::DEBUG = $DEBUG;
+$Business::OnlinePayment::VirtualNet::DEBUG += 0; #quiet warnings with old perl
 
 #     Use this merchant information for testing only. 
 #  
